@@ -21,6 +21,10 @@
 #include <model/statedata.h>
 #include <armv/machine.h>
 
+#ifdef CONFIG_ARM_HYPERVISOR_SUPPORT
+#include <mode/machine/gic_v3_gen.h>
+#endif
+
 #include "gic_common.h"
 
 #define GIC_PRI_LOWEST     0xf0

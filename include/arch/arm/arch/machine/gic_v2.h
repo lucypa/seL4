@@ -18,6 +18,9 @@
 #include <mode/smp/smp.h>
 #include <model/statedata.h>
 
+#ifdef CONFIG_ARM_HYPERVISOR_SUPPORT
+#include <mode/machine/gic_v2_gen.h>
+#endif
 #include "gic_common.h"
 
 #define IRQ_MASK MASK(10u)
