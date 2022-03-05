@@ -318,7 +318,7 @@ static void nextDomain(void)
 }
 
 #ifdef CONFIG_KERNEL_MCS
-void switchSchedContext(void)
+static void switchSchedContext(void)
 {
     if (unlikely(NODE_STATE(ksCurSC) != NODE_STATE(ksCurThread)->tcbSchedContext)) {
         NODE_STATE(ksReprogram) = true;
@@ -340,7 +340,7 @@ void switchSchedContext(void)
 }
 #endif
 
-void scheduleChooseNewThread(void)
+static void scheduleChooseNewThread(void)
 {
     if (ksDomainTime == 0) {
         nextDomain();
