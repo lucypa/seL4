@@ -14,9 +14,7 @@
 
 #ifdef CONFIG_ARCH_ARM
 static inline
-#ifndef CONFIG_ARCH_ARM_V6
 FORCE_INLINE
-#endif
 #endif
 void NORETURN fastpath_signal(word_t cptr, word_t msgInfo)
 {
@@ -25,6 +23,8 @@ void NORETURN fastpath_signal(word_t cptr, word_t msgInfo)
     pde_t stored_hw_asid;
     word_t fault_type;
     dom_t dom;
+    sched_context_t *sc = NULL;
+
     /* Get fault type. */
     fault_type = seL4_Fault_get_seL4_FaultType(NODE_STATE(ksCurThread)->tcbFault);
 
@@ -76,13 +76,16 @@ void NORETURN fastpath_signal(word_t cptr, word_t msgInfo)
     case NtfnState_Idle: {
         /* Check if we are bound and that thread is waiting for a message */
         if (dest && thread_state_ptr_get_tsType(&dest->tcbState) == ThreadState_BlockedOnReceive) {
-            /* Send and start thread running */
-            maybeDonateSchedContext(dest, ntfnPtr);
+            /* Basically equivalent to maybeDonateSchedContext. Check whether the thread already has
+             * a TCB or if it can be donated from the notification. If neither is possible, go to
+             * slowpath */
 
             if (!dest->tcbSchedContext) {
-                slowpath(SysSend);
+                sc = SC_PTR(notification_ptr_get_ntfnSchedContext(ntfnPtr));
+                if (sc == NULL || sc->scTcb != NULL) {
+                    slowpath(SysSend);
+                }
             }
-
             // Equivalent to cancel_ipc
             endpoint_t *ep_ptr;
             ep_ptr = EP_PTR(thread_state_get_blockingObject(dest->tcbState));
@@ -97,6 +100,10 @@ void NORETURN fastpath_signal(word_t cptr, word_t msgInfo)
 #ifdef CONFIG_BENCHMARK_TRACK_KERNEL_ENTRIES
                 ksKernelEntry.is_fastpath = true;
 #endif
+                if (!dest->tcbSchedContext) {
+                    schedContext_donate(sc, dest);
+                }
+                assert(dest->tcbSchedContext);
 
                 setRegister(dest, badgeRegister, badge);
                 thread_state_ptr_set_tsType_np(&dest->tcbState, ThreadState_Running);
@@ -105,28 +112,6 @@ void NORETURN fastpath_signal(word_t cptr, word_t msgInfo)
                 restore_user_context();
                 UNREACHABLE();
             }
-#ifdef CONFIG_VTX
-        } else if (dest && thread_state_ptr_get_tsType(&dest->tcbState) == ThreadState_RunningVM) {
-            if (tcb->tcbAffinity != getCurrentCPUIndex()) {
-                ntfn_set_active(ntfnPtr, badge);
-                doRemoteVMCheckBoundNotification(tcb->tcbAffinity, tcb);
-                restore_user_context();
-                UNREACHABLE();
-            } else {
-                Arch_leaveVMAsyncTransfer(tcb);
-                if (NODE_STATE(ksCurThread)->tcbPriority >= dest->tcbPriority) {
-#ifdef CONFIG_BENCHMARK_TRACK_KERNEL_ENTRIES
-                    ksKernelEntry.is_fastpath = true;
-#endif
-                    setRegister(dest, badgeRegister, badge);
-                    thread_state_ptr_set_tsType_np(&dest->tcbState, ThreadState_Running);
-                    /* continue executing signaller */
-                    tcbSchedEnqueue(dest);
-                    restore_user_context();
-                    UNREACHABLE();
-                }
-            }
-#endif
         } else {
             ntfn_set_active(ntfnPtr, badge);
             restore_user_context();
@@ -135,24 +120,39 @@ void NORETURN fastpath_signal(word_t cptr, word_t msgInfo)
         break;
     }
     case NtfnState_Waiting: {
-        maybeDonateSchedContext(dest, ntfnPtr);
+        /* Basically equivalent to maybeDonateSchedContext. Check whether the thread already has
+         * a TCB or if it can be donated from the notification. If neither is possible, go to
+         * slowpath */
 
         if (!dest->tcbSchedContext) {
-            slowpath(SysSend);
+            sc = SC_PTR(notification_ptr_get_ntfnSchedContext(ntfnPtr));
+            if (sc == NULL || sc->scTcb != NULL) {
+                slowpath(SysSend);
+            }
         }
 
-        // Anna
-        notification_ptr_set_ntfnQueue_head_np(ntfnPtr, TCB_REF(dest->tcbEPNext));
-        if (unlikely(dest->tcbEPNext)) {
-            dest->tcbEPNext->tcbEPPrev = NULL;
-        } else {
-            notification_ptr_mset_ntfnQueue_tail_state(ntfnPtr, 0, NtfnState_Idle);
+        tcb_queue_t ntfn_queue;
+        ntfn_queue.head = (tcb_t *)notification_ptr_get_ntfnQueue_head(ntfnPtr);
+        ntfn_queue.end = (tcb_t *)notification_ptr_get_ntfnQueue_tail(ntfnPtr);
+
+        ntfn_queue = tcbEPDequeue(dest, ntfn_queue);
+
+        notification_ptr_set_ntfnQueue_head(ntfnPtr, (word_t)ntfn_queue.head);
+        notification_ptr_set_ntfnQueue_tail(ntfnPtr, (word_t)ntfn_queue.end);
+
+        if (!ntfn_queue.head) {
+            notification_ptr_set_state(ntfnPtr, NtfnState_Idle);
         }
 
         if (NODE_STATE(ksCurThread)->tcbPriority >= dest->tcbPriority) {
 #ifdef CONFIG_BENCHMARK_TRACK_KERNEL_ENTRIES
             ksKernelEntry.is_fastpath = true;
 #endif
+            if (!dest->tcbSchedContext) {
+                schedContext_donate(sc, dest);
+            }
+            assert(dest->tcbSchedContext);
+
             setRegister(dest, badgeRegister, badge);
             thread_state_ptr_set_tsType_np(&dest->tcbState, ThreadState_Running);
             SCHED_ENQUEUE(dest);
@@ -235,9 +235,16 @@ void NORETURN fastpath_signal(word_t cptr, word_t msgInfo)
         slowpath(SysSend);
     }
 
+    /*                    Point of no return                          */
+
 #ifdef CONFIG_BENCHMARK_TRACK_KERNEL_ENTRIES
     ksKernelEntry.is_fastpath = true;
 #endif
+
+    if (!dest->tcbSchedContext) {
+        schedContext_donate(sc, dest);
+    }
+    assert(dest->tcbSchedContext);
 
     thread_state_ptr_set_tsType_np(&dest->tcbState, ThreadState_Running);
     updateTimestamp();

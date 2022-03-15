@@ -119,41 +119,5 @@ static inline reply_t *thread_state_get_replyObject_np(thread_state_t ts)
 }
 #endif
 
-static inline void cancelSignal_fp(tcb_t *tptr, notification_t *ntfnPtr)
-{
-    tcb_queue_t ntfn_queue;
-
-    /* Haskell error "cancelSignal: notification object must be in a waiting" state */
-    assert(notification_ptr_get_state(ntfnPtr) == NtfnState_Waiting);
-
-    ntfn_queue.head = (tcb_t *)notification_ptr_get_ntfnQueue_head(ntfnPtr);
-    ntfn_queue.end = (tcb_t *)notification_ptr_get_ntfnQueue_tail(ntfnPtr);
-
-    /* Dequeue TCB */
-    ntfn_queue = tcbEPDequeue(tptr, ntfn_queue);
-    notification_ptr_set_ntfnQueue_head(ntfnPtr, (word_t)ntfn_queue.head);
-    notification_ptr_set_ntfnQueue_tail(ntfnPtr, (word_t)ntfn_queue.end);
-
-    /* set the thread state to idle if the queue is empty */
-    if (!ntfn_queue.head) {
-        notification_ptr_set_state(ntfnPtr, NtfnState_Idle);
-    }
-
-    /* Make thread inactive */
-    thread_state_ptr_set_tsType_np(&tptr->tcbState, ThreadState_Inactive);
-}
-
-
-static inline void notification_ptr_set_ntfnQueue_head_np(notification_t *ntfn_ptr, word_t ntfnQueue_head)
-{
-    ntfn_ptr->words[1] = ntfnQueue_head;
-}
-
-static inline void notification_ptr_mset_ntfnQueue_tail_state(notification_t *ntfn_ptr, word_t ntfnQueue_tail,
-                                                              word_t state)
-{
-    ntfn_ptr->words[0] = ntfnQueue_tail | state;
-}
-
 #include <arch/fastpath/fastpath.h>
 
