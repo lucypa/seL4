@@ -86,17 +86,22 @@ void NORETURN fastpath_signal(word_t cptr, word_t msgInfo)
                     slowpath(SysSend);
                 }
             }
-            // Equivalent to cancel_ipc
-            endpoint_t *ep_ptr;
-            ep_ptr = EP_PTR(thread_state_get_blockingObject(dest->tcbState));
-            endpoint_ptr_set_epQueue_head_np(ep_ptr, TCB_REF(dest->tcbEPNext));
-            if (unlikely(dest->tcbEPNext)) {
-                dest->tcbEPNext->tcbEPPrev = NULL;
-            } else {
-                endpoint_ptr_mset_epQueue_tail_state(ep_ptr, 0, EPState_Idle);
-            }
 
             if (NODE_STATE(ksCurThread)->tcbPriority >= dest->tcbPriority) {
+
+                /*  Point of no return */
+
+                // Equivalent to cancel_ipc
+                endpoint_t *ep_ptr;
+                ep_ptr = EP_PTR(thread_state_get_blockingObject(dest->tcbState));
+                endpoint_ptr_set_epQueue_head_np(ep_ptr, TCB_REF(dest->tcbEPNext));
+                if (unlikely(dest->tcbEPNext)) {
+                    dest->tcbEPNext->tcbEPPrev = NULL;
+                } else {
+                    endpoint_ptr_mset_epQueue_tail_state(ep_ptr, 0, EPState_Idle);
+                }
+
+
 #ifdef CONFIG_BENCHMARK_TRACK_KERNEL_ENTRIES
                 ksKernelEntry.is_fastpath = true;
 #endif
@@ -131,20 +136,23 @@ void NORETURN fastpath_signal(word_t cptr, word_t msgInfo)
             }
         }
 
-        tcb_queue_t ntfn_queue;
-        ntfn_queue.head = (tcb_t *)notification_ptr_get_ntfnQueue_head(ntfnPtr);
-        ntfn_queue.end = (tcb_t *)notification_ptr_get_ntfnQueue_tail(ntfnPtr);
-
-        ntfn_queue = tcbEPDequeue(dest, ntfn_queue);
-
-        notification_ptr_set_ntfnQueue_head(ntfnPtr, (word_t)ntfn_queue.head);
-        notification_ptr_set_ntfnQueue_tail(ntfnPtr, (word_t)ntfn_queue.end);
-
-        if (!ntfn_queue.head) {
-            notification_ptr_set_state(ntfnPtr, NtfnState_Idle);
-        }
-
         if (NODE_STATE(ksCurThread)->tcbPriority >= dest->tcbPriority) {
+
+             /*  Point of no return */
+
+            tcb_queue_t ntfn_queue;
+            ntfn_queue.head = (tcb_t *)notification_ptr_get_ntfnQueue_head(ntfnPtr);
+            ntfn_queue.end = (tcb_t *)notification_ptr_get_ntfnQueue_tail(ntfnPtr);
+
+            ntfn_queue = tcbEPDequeue(dest, ntfn_queue);
+
+            notification_ptr_set_ntfnQueue_head(ntfnPtr, (word_t)ntfn_queue.head);
+            notification_ptr_set_ntfnQueue_tail(ntfnPtr, (word_t)ntfn_queue.end);
+
+            if (!ntfn_queue.head) {
+                notification_ptr_set_state(ntfnPtr, NtfnState_Idle);
+            }
+
 #ifdef CONFIG_BENCHMARK_TRACK_KERNEL_ENTRIES
             ksKernelEntry.is_fastpath = true;
 #endif
@@ -202,8 +210,10 @@ void NORETURN fastpath_signal(word_t cptr, word_t msgInfo)
 #endif
 
     // TODO: Needed?
-    /* Try and wake up threads - this makes everything fail */
-    // awaken();
+    /* This is the check used in awaken() - if we have to do this, we should go to the slowpath */
+    if (unlikely(NODE_STATE(ksReleaseHead) != NULL && refill_ready(NODE_STATE(ksReleaseHead)->tcbSchedContext))) {
+        slowpath(SysSend);
+    }
 
     /* Let gcc optimise this out for 1 domain */
     dom = maxDom ? ksCurDomain : 0;
@@ -229,17 +239,49 @@ void NORETURN fastpath_signal(word_t cptr, word_t msgInfo)
         slowpath(SysSend);
     }
 #endif /* ENABLE_SMP_SUPPORT */
-    // TODO: Needed?
-    /* This is basically the check in checkDomainTime(), which needs more scheduler logic */
+
+    /* This is basically the check in checkDomainTime(), which needs more scheduler logic and so is sent to slowpath*/
     if (unlikely(isCurDomainExpired())) {
         slowpath(SysSend);
     }
 
-    /*                    Point of no return                          */
+    /*
+     * --- POINT OF NO RETURN ---
+     *
+     * At this stage, we have committed to performing the Signal.
+     */
 
 #ifdef CONFIG_BENCHMARK_TRACK_KERNEL_ENTRIES
     ksKernelEntry.is_fastpath = true;
 #endif
+
+    switch (ntfnState) {
+    case NtfnState_Idle: {
+        // Equivalent to cancel_ipc
+        endpoint_t *ep_ptr;
+        ep_ptr = EP_PTR(thread_state_get_blockingObject(dest->tcbState));
+        endpoint_ptr_set_epQueue_head_np(ep_ptr, TCB_REF(dest->tcbEPNext));
+        if (unlikely(dest->tcbEPNext)) {
+            dest->tcbEPNext->tcbEPPrev = NULL;
+        } else {
+            endpoint_ptr_mset_epQueue_tail_state(ep_ptr, 0, EPState_Idle);
+        }
+    }
+    case NtfnState_Waiting: {
+        tcb_queue_t ntfn_queue;
+        ntfn_queue.head = (tcb_t *)notification_ptr_get_ntfnQueue_head(ntfnPtr);
+        ntfn_queue.end = (tcb_t *)notification_ptr_get_ntfnQueue_tail(ntfnPtr);
+
+        ntfn_queue = tcbEPDequeue(dest, ntfn_queue);
+
+        notification_ptr_set_ntfnQueue_head(ntfnPtr, (word_t)ntfn_queue.head);
+        notification_ptr_set_ntfnQueue_tail(ntfnPtr, (word_t)ntfn_queue.end);
+
+        if (!ntfn_queue.head) {
+            notification_ptr_set_state(ntfnPtr, NtfnState_Idle);
+        }
+    }
+    }
 
     if (!dest->tcbSchedContext) {
         schedContext_donate(sc, dest);
@@ -270,13 +312,10 @@ void NORETURN fastpath_signal(word_t cptr, word_t msgInfo)
         refill_unblock_check(dest->tcbSchedContext);
     }
 
-    NODE_STATE(ksCurSC) = NODE_STATE(ksCurThread)->tcbSchedContext;
+    assert(refill_ready(NODE_STATE(ksCurThread)->tcbSchedContext));
+    assert(refill_sufficient(NODE_STATE(ksCurThread)->tcbSchedContext, 0));
 
-    /* TODO: In case NODE_STATE(ksSchedulerAction) was messed up by awaken(). Is awaken needed though? */
-//    if (NODE_STATE(ksSchedulerAction) != SchedulerAction_ResumeCurrentThread) {
-//        SCHED_ENQUEUE(NODE_STATE(ksSchedulerAction));
-//        NODE_STATE(ksSchedulerAction) = SchedulerAction_ResumeCurrentThread;
-//    }
+    NODE_STATE(ksCurSC) = NODE_STATE(ksCurThread)->tcbSchedContext;
 
     fastpath_restore(badge, getRegister(NODE_STATE(ksCurThread), msgInfoRegister), NODE_STATE(ksCurThread));
     UNREACHABLE();
