@@ -166,6 +166,7 @@ if(DEFINED KernelDTSList AND (NOT "${KernelDTSList}" STREQUAL ""))
         # Check if we're using the macOS version, otherwise assume GNU coreutils.
         # CMAKE_HOST_APPLE is a built-in CMake variable.
         if(CMAKE_HOST_APPLE AND "${STAT_TOOL}" STREQUAL "/usr/bin/stat")
+        # if (CMAKE_HOST_APPLE)
             set(STAT_ARGS "-f%z")
         else()
             set(STAT_ARGS "-c '%s'")
