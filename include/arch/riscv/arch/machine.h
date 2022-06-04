@@ -1,6 +1,7 @@
 /*
  * Copyright 2020, Data61, CSIRO (ABN 41 687 119 230)
  * Copyright 2015, 2016 Hesham Almatary <heshamelmatary@gmail.com>
+ * Copyright 2021, HENSOLDT Cyber
  *
  * SPDX-License-Identifier: GPL-2.0-only
  */
@@ -14,6 +15,36 @@
 #include <arch/model/statedata.h>
 #include <arch/sbi.h>
 #include <mode/machine.h>
+
+/* Bit flags in CSR MIP/SIP (interrupt pending). */
+/* Bit 0 was SIP_USIP, but the N extension will be dropped in v1.12 */
+#define SIP_SSIP   1 /* S-Mode software interrupt pending. */
+/* Bit 2 was SIP_HSIP in v1.9, but the H extension was reworked afterwards. */
+#define SIP_MSIP   3 /* M-Mode software interrupt pending (MIP only). */
+/* Bit 4 was SIP_UTIP, but the N extension will be dropped in v1.12 */
+#define SIP_STIP   5 /* S-Mode timer interrupt pending. */
+/* Bit 6 was SIP_HTIP in v1.9, but the H extension was reworked afterwards. */
+#define SIP_MTIP   7 /* M-Mode timer interrupt pending (MIP only). */
+/* Bit 8 was SIP_UEIP, but the N extension will be dropped in v1.12 */
+#define SIP_SEIP   9 /* S-Mode external interrupt pending. */
+/* Bit 10 was SIP_HEIP in v1.9, but the H extension was reworked afterwards. */
+#define SIP_MEIP  11 /* M-Mode external interrupt pending (MIP only). */
+/* Bit 12 and above are reserved. */
+
+/* Bit flags in CSR MIE/SIE (interrupt enable). */
+/* Bit 0 was SIE_USIE, but the N extension will be dropped in v1.12 */
+#define SIE_SSIE   1 /* S-Mode software interrupt enable. */
+/* Bit 2 was SIE_HSIE in v1.9, but the H extension was reworked afterwards. */
+#define SIE_MSIE   3 /* M-Mode software interrupt enable (MIP only). */
+/* Bit 4 was SIE_UTIE, but the N extension will be dropped in v1.12 */
+#define SIE_STIE   5 /* S-Mode timer interrupt enable. */
+/* Bit 6 was SIE_HTIE in v1.9, but the H extension was reworked afterwards. */
+#define SIE_MTIE   7 /* M-Mode timer interrupt enable (MIP only). */
+/* Bit 8 was SIE_UEIE, but the N extension will be dropped in v1.12 */
+#define SIE_SEIE   9 /* S-Mode external interrupt enable. */
+/* Bit 10 was SIE_HEIE in v1.9, but the H extension was reworked afterwards. */
+#define SIE_MEIE  11 /* M-Mode external interrupt enable (MIP only). */
+/* Bit 12 and above are reserved. */
 
 #ifdef ENABLE_SMP_SUPPORT
 
@@ -47,31 +78,30 @@ static inline void sfence_local(void)
     asm volatile("sfence.vma" ::: "memory");
 }
 
-static inline void ifence(void)
+static inline word_t get_sbi_mask_for_all_remote_harts(void)
 {
-    ifence_local();
-
-    unsigned long mask = 0;
+    word_t mask = 0;
     for (int i = 0; i < CONFIG_MAX_NUM_NODES; i++) {
         if (i != getCurrentCPUIndex()) {
             mask |= BIT(cpuIndexToID(i));
         }
     }
-    sbi_remote_fence_i(&mask);
+    return mask;
+}
+
+static inline void ifence(void)
+{
+    ifence_local();
+    word_t mask = get_sbi_mask_for_all_remote_harts();
+    sbi_remote_fence_i(mask);
 }
 
 static inline void sfence(void)
 {
     fence_w_rw();
     sfence_local();
-
-    unsigned long mask = 0;
-    for (int i = 0; i < CONFIG_MAX_NUM_NODES; i++) {
-        if (i != getCurrentCPUIndex()) {
-            mask |= BIT(cpuIndexToID(i));
-        }
-    }
-    sbi_remote_sfence_vma(&mask, 0, 0);
+    word_t mask = get_sbi_mask_for_all_remote_harts();
+    sbi_remote_sfence_vma(mask, 0, 0);
 }
 
 static inline void hwASIDFlushLocal(asid_t asid)
@@ -82,14 +112,8 @@ static inline void hwASIDFlushLocal(asid_t asid)
 static inline void hwASIDFlush(asid_t asid)
 {
     hwASIDFlushLocal(asid);
-
-    unsigned long mask = 0;
-    for (int i = 0; i < CONFIG_MAX_NUM_NODES; i++) {
-        if (i != getCurrentCPUIndex()) {
-            mask |= BIT(cpuIndexToID(i));
-        }
-    }
-    sbi_remote_sfence_vma_asid(&mask, 0, 0, asid);
+    word_t mask = get_sbi_mask_for_all_remote_harts();
+    sbi_remote_sfence_vma_asid(mask, 0, 0, asid);
 }
 
 #else
@@ -160,6 +184,18 @@ static inline word_t read_sip(void)
     return temp;
 }
 
+static inline void write_sie(word_t value)
+{
+    asm volatile("csrw sie,  %0" :: "r"(value));
+}
+
+static inline word_t read_sie(void)
+{
+    word_t temp;
+    asm volatile("csrr %0, sie" : "=r"(temp));
+    return temp;
+}
+
 static inline void set_sie_mask(word_t mask_high)
 {
     word_t temp;
@@ -211,11 +247,6 @@ static inline void setVSpaceRoot(paddr_t addr, asid_t asid)
 #endif
 }
 
-static inline void Arch_finaliseInterrupt(void)
-{
-    /* Nothing architecture specific to be done. */
-}
-
 void map_kernel_devices(void);
 
 /** MODIFIES: [*] */
@@ -230,18 +261,22 @@ void setIRQTrigger(irq_t irq, bool_t trigger);
 
 static inline void arch_pause(void)
 {
-    // use a memory fence to delay a bit.
-    // other alternatives?
+    /* Currently, a memory fence seems the best option to delay execution at
+     * least a bit. The ZiHintPause extension defines PAUSE, it's encoded as
+     * FENCE instruction with fm=0, pred=W, succ=0, rd=x0, rs1=x0. Once it is
+     * supported we could use 'asm volatile("pause")' as an improvement.
+     */
     fence_rw_rw();
 }
 
 #endif
 
 /* Update the value of the actual register to hold the expected value */
-static inline void Arch_setTLSRegister(word_t tls_base)
+static inline exception_t Arch_setTLSRegister(word_t tls_base)
 {
     /* The register is always reloaded upon return from kernel. */
     setRegister(NODE_STATE(ksCurThread), TLS_BASE, tls_base);
+    return EXCEPTION_NONE;
 }
 
 #endif // __ASSEMBLER__

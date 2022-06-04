@@ -43,6 +43,7 @@ import xml.dom.minidom
 from argparse import ArgumentParser
 import sys
 from functools import reduce
+from condition import condition_to_cpp
 
 # Number of bits in a standard word
 WORD_SIZE_BITS_ARCH = {
@@ -847,7 +848,7 @@ def parse_xml_file(input_file, valid_types):
         for method in interface.getElementsByTagName("method"):
             method_name = method.getAttribute("name")
             method_id = method.getAttribute("id")
-            method_condition = method.getAttribute("condition")
+            method_condition = condition_to_cpp(method.getElementsByTagName("condition"))
             method_manual_name = method.getAttribute("manual_name") or method_name
             method_manual_label = method.getAttribute("manual_label")
 
@@ -930,6 +931,17 @@ def parse_xml_file(input_file, valid_types):
                 else:
                     comment_lines.append("@return @xmlonly <errorenumdesc/> @endxmlonly")
 
+            for error in method.getElementsByTagName("error"):
+                error_name = error.getAttribute("name")
+                error_description = error.getAttribute("description")
+                if not error_description:
+                    error_description_element = error.getElementsByTagName("description")
+                    if error_description_element:
+                        error_description_text = get_xml_element_content_with_xmlonly(
+                            error_description_element[0])
+                        error_description = normalise_text(error_description_text)
+                comment_lines.append("@retval %s %s " % (error_name, error_description))
+
             # split each line on newlines
             comment_lines = reduce(operator.add, [l.split("\n") for l in comment_lines], [])
 
@@ -969,8 +981,7 @@ def generate_stub_file(arch, wordsize, input_files, output_file, use_only_ipc_bu
  * Automatically generated system call stubs.
  */
 
-#ifndef __LIBSEL4_SEL4_CLIENT_H
-#define __LIBSEL4_SEL4_CLIENT_H
+#pragma once
 """)
 
     # Emit the includes
@@ -1023,10 +1034,6 @@ def generate_stub_file(arch, wordsize, input_files, output_file, use_only_ipc_bu
                                     method_id, inputs, outputs, structs, use_only_ipc_buffer, comment, mcs))
         if condition != "":
             result.append("#endif")
-
-    # Print footer.
-    result.append("#endif /* __LIBSEL4_SEL4_CLIENT_H */")
-    result.append("")
 
     # Write the output
     output = open(output_file, "w")

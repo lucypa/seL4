@@ -102,6 +102,7 @@ BOOT_CODE static bool_t insert_region(region_t reg)
     if (is_reg_empty(reg)) {
         return true;
     }
+
     for (word_t i = 0; i < ARRAY_SIZE(ndks_boot.freemem); i++) {
         if (is_reg_empty(ndks_boot.freemem[i])) {
             reserve_region(pptr_to_paddr_reg(reg));
@@ -109,21 +110,25 @@ BOOT_CODE static bool_t insert_region(region_t reg)
             return true;
         }
     }
-#ifdef CONFIG_ARCH_ARM
-    /* boot.h should have calculated MAX_NUM_FREEMEM_REG correctly.
-     * If we've run out, then something is wrong.
-     * Note that the capDL allocation toolchain does not know about
-     * MAX_NUM_FREEMEM_REG, so throwing away regions may prevent
-     * capDL applications from being loaded! */
-    printf("Can't fit memory region 0x%"SEL4_PRIx_word"-0x%"SEL4_PRIx_word
-           ", try increasing MAX_NUM_FREEMEM_REG (currently %d)\n",
-           reg.start, reg.end, (int)MAX_NUM_FREEMEM_REG);
-    assert(!"Ran out of freemem slots");
-#else
-    printf("Dropping memory region 0x%"SEL4_PRIx_word"-0x%"SEL4_PRIx_word
-           ", try increasing MAX_NUM_FREEMEM_REG (currently %d)\n",
-           reg.start, reg.end, (int)MAX_NUM_FREEMEM_REG);
-#endif
+
+    /* We don't know if a platform or architecture picked MAX_NUM_FREEMEM_REG
+     * arbitrarily or carefully calculated it to be big enough. Running out of
+     * slots here is not really fatal, eventually memory allocation may fail
+     * if there is not enough free memory. However, allocations should never
+     * blindly assume to work, some error handling must always be in place even
+     * if the environment has been crafted carefully to support them. Thus, we
+     * don't stop the boot process here, but return an error. The caller should
+     * decide how bad this is.
+     */
+    printf("no free memory slot left for [%"SEL4_PRIx_word"..%"SEL4_PRIx_word"],"
+           " consider increasing MAX_NUM_FREEMEM_REG (%u)\n",
+           reg.start, reg.end, (unsigned int)MAX_NUM_FREEMEM_REG);
+
+    /* For debug builds we consider this a fatal error. Rationale is, that the
+     * caller does not check the error code at the moment, but just ignores any
+     * failures silently. */
+    assert(0);
+
     return false;
 }
 
@@ -200,8 +205,10 @@ BOOT_CODE static void create_rootserver_objects(pptr_t start, v_region_t it_v_re
     /* at this point we are up to creating 4k objects - which is the min size of
      * extra_bi so this is the last chance to allocate it */
     maybe_alloc_extra_bi(seL4_PageBits, extra_bi_size_bits);
+    compile_assert(invalid_seL4_ASIDPoolBits, seL4_ASIDPoolBits == seL4_PageBits);
     rootserver.asid_pool = alloc_rootserver_obj(seL4_ASIDPoolBits, 1);
     rootserver.ipc_buf = alloc_rootserver_obj(seL4_PageBits, 1);
+    compile_assert(invalid_BI_FRAME_SIZE_BITS, BI_FRAME_SIZE_BITS == seL4_PageBits);
     rootserver.boot_info = alloc_rootserver_obj(BI_FRAME_SIZE_BITS, 1);
 
     /* TCBs on aarch32 can be larger than page tables in certain configs */
@@ -371,16 +378,22 @@ BOOT_CODE create_frames_of_region_ret_t create_frames_of_region(
         } else {
             frame_cap = create_unmapped_it_frame_cap(f, false);
         }
-        if (!provide_cap(root_cnode_cap, frame_cap))
+        if (!provide_cap(root_cnode_cap, frame_cap)) {
             return (create_frames_of_region_ret_t) {
-            S_REG_EMPTY, false
-        };
+                .region  = S_REG_EMPTY,
+                .success = false
+            };
+        }
     }
 
     slot_pos_after = ndks_boot.slot_pos_cur;
 
     return (create_frames_of_region_ret_t) {
-        (seL4_SlotRegion) { slot_pos_before, slot_pos_after }, true
+        .region = (seL4_SlotRegion) {
+            .start = slot_pos_before,
+            .end   = slot_pos_after
+        },
+        .success = true
     };
 }
 
@@ -448,6 +461,7 @@ BOOT_CODE bool_t create_idle_thread(void)
         bool_t result = configure_sched_context(NODE_STATE_ON_CORE(ksIdleThread, i), SC_PTR(&ksIdleThreadSC[SMP_TERNARY(i, 0)]),
                                                 usToTicks(CONFIG_BOOT_THREAD_TIME_SLICE * US_IN_MS), SMP_TERNARY(i, 0));
         SMP_COND_STATEMENT(NODE_STATE_ON_CORE(ksIdleThread, i)->tcbSchedContext->scCore = i;)
+        NODE_STATE_ON_CORE(ksIdleSC, i) = SC_PTR(&ksIdleThreadSC[SMP_TERNARY(i, 0)]);
         if (!result) {
             printf("Kernel init failed: Unable to allocate sc for idle thread\n");
             return false;
@@ -577,7 +591,10 @@ BOOT_CODE static bool_t provide_untyped_cap(
     word_t i = ndks_boot.slot_pos_cur - first_untyped_slot;
     if (i < CONFIG_MAX_NUM_BOOTINFO_UNTYPED_CAPS) {
         ndks_boot.bi_frame->untypedList[i] = (seL4_UntypedDesc) {
-            pptr_to_paddr((void *)pptr), size_bits, device_memory, {0}
+            .paddr    = pptr_to_paddr((void *)pptr),
+            .sizeBits = size_bits,
+            .isDevice = device_memory,
+            .padding  = {0}
         };
         ut_cap = cap_untyped_cap_new(MAX_FREE_INDEX(size_bits),
                                      device_memory, size_bits, pptr);
@@ -596,27 +613,27 @@ BOOT_CODE bool_t create_untypeds_for_region(
     seL4_SlotPos first_untyped_slot
 )
 {
-    word_t align_bits;
-    word_t size_bits;
-
     while (!is_reg_empty(reg)) {
-        /* Determine the maximum size of the region */
-        size_bits = seL4_WordBits - 1 - clzl(reg.end - reg.start);
 
-        /* Determine the alignment of the region */
-        if (reg.start != 0) {
-            align_bits = ctzl(reg.start);
-        } else {
-            align_bits = size_bits;
-        }
-        /* Reduce size bits to align if needed */
-        if (align_bits < size_bits) {
-            size_bits = align_bits;
-        }
+        /* Calculate the bit size of the region. */
+        unsigned int size_bits = seL4_WordBits - 1 - clzl(reg.end - reg.start);
+        /* The size can't exceed the largest possible untyped size. */
         if (size_bits > seL4_MaxUntypedBits) {
             size_bits = seL4_MaxUntypedBits;
         }
-
+        /* The start address 0 satisfies any alignment needs, otherwise ensure
+         * the region's bit size does not exceed the alignment of the region.
+         */
+        if (0 != reg.start) {
+            unsigned int align_bits = ctzl(reg.start);
+            if (size_bits > align_bits) {
+                size_bits = align_bits;
+            }
+        }
+        /* Provide an untyped capability for the region only if it is large
+         * enough to be retyped into objects later. Otherwise the region can't
+         * be used anyway.
+         */
         if (size_bits >= seL4_MinUntypedBits) {
             if (!provide_untyped_cap(root_cnode_cap, device_memory, reg.start, size_bits, first_untyped_slot)) {
                 return false;
@@ -639,6 +656,9 @@ BOOT_CODE bool_t create_untypeds(cap_t root_cnode_cap,
                 start, ndks_boot.reserved[i].start
             });
             if (!create_untypeds_for_region(root_cnode_cap, true, reg, first_untyped_slot)) {
+                printf("ERROR: creation of untypeds for device region #%u at"
+                       " [%"SEL4_PRIx_word"..%"SEL4_PRIx_word"] failed\n",
+                       (unsigned int)i, reg.start, reg.end);
                 return false;
             }
         }
@@ -650,20 +670,20 @@ BOOT_CODE bool_t create_untypeds(cap_t root_cnode_cap,
         region_t reg = paddr_to_pptr_reg((p_region_t) {
             start, CONFIG_PADDR_USER_DEVICE_TOP
         });
-        /*
-         * The auto-generated bitfield code will get upset if the
-         * end pptr is larger than the maximum pointer size for this architecture.
-         */
-        if (reg.end > PPTR_TOP) {
-            reg.end = PPTR_TOP;
-        }
+
         if (!create_untypeds_for_region(root_cnode_cap, true, reg, first_untyped_slot)) {
+            printf("ERROR: creation of untypeds for top device region"
+                   " [%"SEL4_PRIx_word"..%"SEL4_PRIx_word"] failed\n",
+                   reg.start, reg.end);
             return false;
         }
     }
 
     /* if boot_mem_reuse_reg is not empty, we can create UT objs from boot code/data frames */
     if (!create_untypeds_for_region(root_cnode_cap, false, boot_mem_reuse_reg, first_untyped_slot)) {
+        printf("ERROR: creation of untypeds for recycled boot memory"
+               " [%"SEL4_PRIx_word"..%"SEL4_PRIx_word"] failed\n",
+               boot_mem_reuse_reg.start, boot_mem_reuse_reg.end);
         return false;
     }
 
@@ -672,6 +692,9 @@ BOOT_CODE bool_t create_untypeds(cap_t root_cnode_cap,
         region_t reg = ndks_boot.freemem[i];
         ndks_boot.freemem[i] = REG_EMPTY;
         if (!create_untypeds_for_region(root_cnode_cap, false, reg, first_untyped_slot)) {
+            printf("ERROR: creation of untypeds for free memory region #%u at"
+                   " [%"SEL4_PRIx_word"..%"SEL4_PRIx_word"] failed\n",
+                   (unsigned int)i, reg.start, reg.end);
             return false;
         }
     }
@@ -703,6 +726,70 @@ BOOT_CODE static inline pptr_t ceiling_kernel_window(pptr_t p)
     return p;
 }
 
+BOOT_CODE static bool_t check_available_memory(word_t n_available,
+                                               const p_region_t *available)
+{
+    /* The system configuration is broken if no region is available. */
+    if (0 == n_available) {
+        printf("ERROR: no memory regions available\n");
+        return false;
+    }
+
+    printf("available phys memory regions: %"SEL4_PRIu_word"\n", n_available);
+    /* Force ordering and exclusivity of available regions. */
+    for (word_t i = 0; i < n_available; i++) {
+        const p_region_t *r = &available[i];
+        printf("  [%"SEL4_PRIx_word"..%"SEL4_PRIx_word"]\n", r->start, r->end);
+
+        /* Available regions must be sane */
+        if (r->start > r->end) {
+            printf("ERROR: memory region %"SEL4_PRIu_word" has start > end\n", i);
+            return false;
+        }
+
+        /* Available regions can't be empty. */
+        if (r->start == r->end) {
+            printf("ERROR: memory region %"SEL4_PRIu_word" empty\n", i);
+            return false;
+        }
+
+        /* Regions must be ordered and must not overlap. */
+        if ((i > 0) && (r->start < available[i - 1].end)) {
+            printf("ERROR: memory region %d in wrong order\n", (int)i);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+
+BOOT_CODE static bool_t check_reserved_memory(word_t n_reserved,
+                                              const region_t *reserved)
+{
+    printf("reserved virt address space regions: %"SEL4_PRIu_word"\n",
+           n_reserved);
+    /* Force ordering and exclusivity of reserved regions. */
+    for (word_t i = 0; i < n_reserved; i++) {
+        const region_t *r = &reserved[i];
+        printf("  [%"SEL4_PRIx_word"..%"SEL4_PRIx_word"]\n", r->start, r->end);
+
+        /* Reserved regions must be sane, the size is allowed to be zero. */
+        if (r->start > r->end) {
+            printf("ERROR: reserved region %"SEL4_PRIu_word" has start > end\n", i);
+            return false;
+        }
+
+        /* Regions must be ordered and must not overlap. */
+        if ((i > 0) && (r->start < reserved[i - 1].end)) {
+            printf("ERROR: reserved region %"SEL4_PRIu_word" in wrong order\n", i);
+            return false;
+        }
+    }
+
+    return true;
+}
+
 /* we can't declare arrays on the stack, so this is space for
  * the function below to use. */
 BOOT_BSS static region_t avail_reg[MAX_NUM_FREEMEM_REG];
@@ -714,55 +801,13 @@ BOOT_CODE bool_t init_freemem(word_t n_available, const p_region_t *available,
                               word_t n_reserved, const region_t *reserved,
                               v_region_t it_v_reg, word_t extra_bi_size_bits)
 {
-    /* The system configuration is broken if no region is available */
-    if (0 == n_available) {
-        printf("ERROR: no memory regions available\n");
+
+    if (!check_available_memory(n_available, available)) {
         return false;
     }
 
-    printf("reserved virt address space regions: %"SEL4_PRIu_word"\n",
-           n_reserved);
-    /* Force ordering and exclusivity of reserved regions */
-    for (word_t i = 0; i < n_reserved; i++) {
-        const region_t *r = &reserved[i];
-        printf("  [%"SEL4_PRIx_word"..%"SEL4_PRIx_word"]\n", r->start, r->end);
-
-        /* Reserved regions must be sane, the size is allowed to be zero */
-        if (r->start > r->end) {
-            printf("ERROR: reserved region %"SEL4_PRIu_word" has start > end\n", i);
-            return false;
-        }
-
-        /* regions must be ordered and must not overlap */
-        if ((i > 0) && (r->start < reserved[i - 1].end)) {
-            printf("ERROR: reserved region %"SEL4_PRIu_word" in wrong order\n", i);
-            return false;
-        }
-    }
-
-    printf("available phys memory regions: %"SEL4_PRIu_word"\n", n_available);
-    /* Force ordering and exclusivity of available regions */
-    for (word_t i = 0; i < n_available; i++) {
-        const p_region_t *r = &available[i];
-        printf("  [%"SEL4_PRIx_word"..%"SEL4_PRIx_word"]\n", r->start, r->end);
-
-        /* Available regions must be sane */
-        if (r->start > r->end) {
-            printf("ERROR: memory region %"SEL4_PRIu_word" has start > end\n", i);
-            return false;
-        }
-
-        /* Available regions can't be empty */
-        if (r->start == r->end) {
-            printf("ERROR: memory region %"SEL4_PRIu_word" empty\n", i);
-            return false;
-        }
-
-        /* regions must be ordered and must not overlap */
-        if ((i > 0) && (r->start < available[i - 1].end)) {
-            printf("ERROR: memory region %d in wrong order\n", (int)i);
-            return false;
-        }
+    if (!check_reserved_memory(n_reserved, reserved)) {
+        return false;
     }
 
     for (word_t i = 0; i < ARRAY_SIZE(ndks_boot.freemem); i++) {
@@ -787,7 +832,7 @@ BOOT_CODE bool_t init_freemem(word_t n_available, const p_region_t *available,
             /* skip the entire region - it's empty now after trimming */
             a++;
         } else if (reserved[r].end <= avail_reg[a].start) {
-            /* the reserved region is below the available region - skip it*/
+            /* the reserved region is below the available region - skip it */
             reserve_region(pptr_to_paddr_reg(reserved[r]));
             r++;
         } else if (reserved[r].start >= avail_reg[a].end) {
@@ -834,33 +879,64 @@ BOOT_CODE bool_t init_freemem(word_t n_available, const p_region_t *available,
     }
 
     /* now try to fit the root server objects into a region */
-    word_t i = ARRAY_SIZE(ndks_boot.freemem) - 1;
+    int i = ARRAY_SIZE(ndks_boot.freemem) - 1;
     if (!is_reg_empty(ndks_boot.freemem[i])) {
-        printf("Insufficient MAX_NUM_FREEMEM_REG\n");
+        printf("ERROR: insufficient MAX_NUM_FREEMEM_REG (%u)\n",
+               (unsigned int)MAX_NUM_FREEMEM_REG);
         return false;
     }
     /* skip any empty regions */
-    for (; is_reg_empty(ndks_boot.freemem[i]) && i >= 0; i--);
+    for (; i >= 0 && is_reg_empty(ndks_boot.freemem[i]); i--);
 
     /* try to grab the last available p region to create the root server objects
      * from. If possible, retain any left over memory as an extra p region */
     word_t size = calculate_rootserver_size(it_v_reg, extra_bi_size_bits);
     word_t max = rootserver_max_size_bits(extra_bi_size_bits);
     for (; i >= 0; i--) {
-        word_t next = i + 1;
-        pptr_t start = ROUND_DOWN(ndks_boot.freemem[i].end - size, max);
-        if (start >= ndks_boot.freemem[i].start) {
+        /* Invariant: both i and (i + 1) are valid indices in ndks_boot.freemem. */
+        assert(i < ARRAY_SIZE(ndks_boot.freemem) - 1);
+        /* Invariant; the region at index i is the current candidate.
+         * Invariant: regions 0 up to (i - 1), if any, are additional candidates.
+         * Invariant: region (i + 1) is empty. */
+        assert(is_reg_empty(ndks_boot.freemem[i + 1]));
+        /* Invariant: regions above (i + 1), if any, are empty or too small to use.
+         * Invariant: all non-empty regions are ordered, disjoint and unallocated. */
+
+        /* We make a fresh variable to index the known-empty region, because the
+         * SimplExportAndRefine verification test has poor support for array
+         * indices that are sums of variables and small constants. */
+        int empty_index = i + 1;
+
+        /* Try to take the top-most suitably sized and aligned chunk. */
+        pptr_t unaligned_start = ndks_boot.freemem[i].end - size;
+        pptr_t start = ROUND_DOWN(unaligned_start, max);
+        /* if unaligned_start didn't underflow, and start fits in the region,
+         * then we've found a region that fits the root server objects. */
+        if (unaligned_start <= ndks_boot.freemem[i].end
+            && start >= ndks_boot.freemem[i].start) {
             create_rootserver_objects(start, it_v_reg, extra_bi_size_bits);
-            if (i < ARRAY_SIZE(ndks_boot.freemem)) {
-                ndks_boot.freemem[next].end = ndks_boot.freemem[i].end;
-                ndks_boot.freemem[next].start = start + size;
-            }
+            /* There may be leftovers before and after the memory we used. */
+            /* Shuffle the after leftover up to the empty slot (i + 1). */
+            ndks_boot.freemem[empty_index] = (region_t) {
+                .start = start + size,
+                .end = ndks_boot.freemem[i].end
+            };
+            /* Leave the before leftover in current slot i. */
             ndks_boot.freemem[i].end = start;
-            break;
-        } else if (i < ARRAY_SIZE(ndks_boot.freemem)) {
-            ndks_boot.freemem[next] = ndks_boot.freemem[i];
+            /* Regions i and (i + 1) are now well defined, ordered, disjoint,
+             * and unallocated, so we can return successfully. */
+            return true;
         }
+        /* Region i isn't big enough, so shuffle it up to slot (i + 1),
+         * which we know is unused. */
+        ndks_boot.freemem[empty_index] = ndks_boot.freemem[i];
+        /* Now region i is unused, so make it empty to reestablish the invariant
+         * for the next iteration (when it will be slot i + 1). */
+        ndks_boot.freemem[i] = REG_EMPTY;
     }
 
-    return true;
+    /* We didn't find a big enough region. */
+    printf("ERROR: no free memory region is big enough for root server "
+           "objects, need size/alignment of 2^%"SEL4_PRIu_word"\n", max);
+    return false;
 }

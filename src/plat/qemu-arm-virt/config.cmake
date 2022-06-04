@@ -10,12 +10,23 @@ declare_platform(qemu-arm-virt KernelPlatformQEMUArmVirt PLAT_QEMU_ARM_VIRT Kern
 
 set(MIN_QEMU_VERSION "3.1.0")
 
+set(qemu_user_top 0xa0000000)
 if(KernelPlatformQEMUArmVirt)
     if("${ARM_CPU}" STREQUAL "cortex-a15")
-        declare_seL4_arch(aarch32)
+        if("${KernelSel4Arch}" STREQUAL aarch32)
+            declare_seL4_arch(aarch32)
+        elseif("${KernelSel4Arch}" STREQUAL arm_hyp)
+            declare_seL4_arch(arm_hyp)
+        else()
+            fallback_declare_seL4_arch_default(aarch32)
+        endif()
+        if(KernelSel4ArchArmHyp)
+            set(qemu_user_top 0xe0000000)
+        endif()
         set(QEMU_ARCH "arm")
         set(KernelArmCortexA15 ON)
         set(KernelArchArmV7a ON)
+        set(KernelArchArmV7ve ON)
     elseif("${ARM_CPU}" STREQUAL "cortex-a53")
         declare_seL4_arch(aarch64)
         set(QEMU_ARCH "aarch64")
@@ -34,7 +45,14 @@ if(KernelPlatformQEMUArmVirt)
         set(KernelArmCortexA53 ON)
         set(KernelArchArmV8a ON)
     endif()
-    execute_process(COMMAND qemu-system-${QEMU_ARCH} -version OUTPUT_VARIABLE QEMU_VERSION_STR)
+    execute_process(
+        COMMAND qemu-system-${QEMU_ARCH} -version
+        OUTPUT_VARIABLE QEMU_VERSION_STR
+        RESULT_VARIABLE error
+    )
+    if(error)
+        message(FATAL_ERROR "Failed to determine qemu version (qemu-system-${QEMU_ARCH})")
+    endif()
     string(
         REGEX
             MATCH
@@ -43,7 +61,7 @@ if(KernelPlatformQEMUArmVirt)
             ${QEMU_VERSION_STR}
     )
     if("${QEMU_VERSION}" VERSION_LESS "${MIN_QEMU_VERSION}")
-        message(WARNING "Warning: qemu version should be at least ${MIN_QEMU_VERSION}")
+        message(FATAL_ERROR "Error: qemu version must be at least ${MIN_QEMU_VERSION}")
     endif()
 
     if("${QEMU_MEMORY}" STREQUAL "")
@@ -53,10 +71,14 @@ if(KernelPlatformQEMUArmVirt)
     config_set(KernelARMPlatform ARM_PLAT qemu-arm-virt)
     set(DTBPath "${CMAKE_BINARY_DIR}/virt.dtb")
     set(DTSPath "${CMAKE_BINARY_DIR}/virt.dts")
-    if(KernelArmHypervisorSupport)
+    if(KernelArmHypervisorSupport OR KernelSel4ArchArmHyp)
         set(QEMU_VIRT_OPTION "virtualization=on,highmem=off,secure=off")
     else()
-        set(QEMU_VIRT_OPTION "virtualization=off")
+        if(Kernel32)
+            set(QEMU_VIRT_OPTION "virtualization=off,highmem=off")
+        else()
+            set(QEMU_VIRT_OPTION "virtualization=off")
+        endif()
     endif()
     if(KernelMaxNumNodes)
         set(QEMU_SMP_OPTION "${KernelMaxNumNodes}")
@@ -69,17 +91,27 @@ if(KernelPlatformQEMUArmVirt)
             ${QEMU_BINARY} -machine virt,dumpdtb=${DTBPath},${QEMU_VIRT_OPTION} -m ${QEMU_MEMORY}
             -cpu ${ARM_CPU} -smp ${QEMU_SMP_OPTION} -nographic
         ERROR_VARIABLE QEMU_OUTPUT_MESSAGE
+        RESULT_VARIABLE error
     )
-    string(STRIP ${QEMU_OUTPUT_MESSAGE} QEMU_OUTPUT_MESSAGE)
+    if(${QEMU_OUTPUT_MESSAGE})
+        string(STRIP ${QEMU_OUTPUT_MESSAGE} QEMU_OUTPUT_MESSAGE)
+    endif()
     message(STATUS ${QEMU_OUTPUT_MESSAGE})
+    if(error)
+        message(FATAL_ERROR "Failed to dump DTB using ${QEMU_BINARY})")
+    endif()
     execute_process(
         COMMAND
             dtc -q -I dtb -O dts ${DTBPath}
         OUTPUT_FILE ${DTSPath}
+        RESULT_VARIABLE error
     )
+    if(error)
+        message(FATAL_ERROR "Failed to convert DTB to DTS (${DTBPath})")
+    endif()
     list(APPEND KernelDTSList "${DTSPath}")
     list(APPEND KernelDTSList "src/plat/qemu-arm-virt/overlay-qemu-arm-virt.dts")
-    if(KernelArmHypervisorSupport)
+    if(KernelArmHypervisorSupport OR KernelSel4ArchArmHyp)
         list(APPEND KernelDTSList "src/plat/qemu-arm-virt/overlay-reserve-vm-memory.dts")
     endif()
     declare_default_headers(
@@ -97,4 +129,11 @@ endif()
 add_sources(
     DEP "KernelPlatformQEMUArmVirt"
     CFILES src/arch/arm/machine/gic_v2.c src/arch/arm/machine/l2c_nop.c
+)
+
+config_string(
+    KernelUserTop USER_TOP "Set seL4_UserTop constant"
+    DEFAULT ${qemu_user_top}
+    UNQUOTE
+    DEPENDS "KernelPlatformQEMUArmVirt;KernelSel4ArchAarch32"
 )

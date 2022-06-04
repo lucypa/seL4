@@ -91,7 +91,7 @@ void restart(tcb_t *target)
         cancelIPC(target);
 #ifdef CONFIG_KERNEL_MCS
         setThreadState(target, ThreadState_Restart);
-        if (sc_sporadic(target->tcbSchedContext) && sc_active(target->tcbSchedContext)
+        if (sc_sporadic(target->tcbSchedContext)
             && target->tcbSchedContext != NODE_STATE(ksCurSC)) {
             refill_unblock_check(target->tcbSchedContext);
         }
@@ -142,7 +142,7 @@ void doReplyTransfer(tcb_t *sender, tcb_t *receiver, cte_t *slot, bool_t grant)
     assert(thread_state_get_replyObject(receiver->tcbState) == REPLY_REF(0));
     assert(reply->replyTCB == NULL);
 
-    if (sc_sporadic(receiver->tcbSchedContext) && sc_active(receiver->tcbSchedContext)
+    if (sc_sporadic(receiver->tcbSchedContext)
         && receiver->tcbSchedContext != NODE_STATE_ON_CORE(ksCurSC, receiver->tcbSchedContext->scCore)) {
         refill_unblock_check(receiver->tcbSchedContext);
     }
@@ -417,7 +417,7 @@ void chooseThread(void)
     word_t dom;
     tcb_t *thread;
 
-    if (CONFIG_NUM_DOMAINS > 1) {
+    if (numDomains > 1) {
         dom = ksCurDomain;
     } else {
         dom = 0;
@@ -577,7 +577,7 @@ void setNextInterrupt(void)
     time_t next_interrupt = NODE_STATE(ksCurTime) +
                             refill_head(NODE_STATE(ksCurThread)->tcbSchedContext)->rAmount;
 
-    if (CONFIG_NUM_DOMAINS > 1) {
+    if (numDomains > 1) {
         next_interrupt = MIN(next_interrupt, NODE_STATE(ksCurTime) + ksDomainTime);
     }
 
@@ -588,21 +588,22 @@ void setNextInterrupt(void)
     setDeadline(next_interrupt - getTimerPrecision());
 }
 
-void chargeBudget(ticks_t consumed, bool_t canTimeoutFault, word_t core, bool_t isCurCPU)
+void chargeBudget(ticks_t consumed, bool_t canTimeoutFault)
 {
+    if (likely(NODE_STATE(ksCurSC) != NODE_STATE(ksIdleSC))) {
+        if (isRoundRobin(NODE_STATE(ksCurSC))) {
+            assert(refill_size(NODE_STATE(ksCurSC)) == MIN_REFILLS);
+            refill_head(NODE_STATE(ksCurSC))->rAmount += refill_tail(NODE_STATE(ksCurSC))->rAmount;
+            refill_tail(NODE_STATE(ksCurSC))->rAmount = 0;
+        } else {
+            refill_budget_check(consumed);
+        }
 
-    if (isRoundRobin(NODE_STATE_ON_CORE(ksCurSC, core))) {
-        assert(refill_size(NODE_STATE_ON_CORE(ksCurSC, core)) == MIN_REFILLS);
-        refill_head(NODE_STATE_ON_CORE(ksCurSC, core))->rAmount += refill_tail(NODE_STATE_ON_CORE(ksCurSC, core))->rAmount;
-        refill_tail(NODE_STATE_ON_CORE(ksCurSC, core))->rAmount = 0;
-    } else {
-        refill_budget_check(consumed);
+        assert(refill_head(NODE_STATE(ksCurSC))->rAmount >= MIN_BUDGET);
+        NODE_STATE(ksCurSC)->scConsumed += consumed;
     }
-
-    assert(refill_head(NODE_STATE_ON_CORE(ksCurSC, core))->rAmount >= MIN_BUDGET);
-    NODE_STATE_ON_CORE(ksCurSC, core)->scConsumed += consumed;
-    NODE_STATE_ON_CORE(ksConsumed, core) = 0;
-    if (isCurCPU && likely(isSchedulable(NODE_STATE_ON_CORE(ksCurThread, core)))) {
+    NODE_STATE(ksConsumed) = 0;
+    if (likely(isSchedulable(NODE_STATE(ksCurThread)))) {
         assert(NODE_STATE(ksCurThread)->tcbSchedContext == NODE_STATE(ksCurSC));
         endTimeslice(canTimeoutFault);
         rescheduleRequired();
@@ -645,7 +646,7 @@ void timerTick(void)
         }
     }
 
-    if (CONFIG_NUM_DOMAINS > 1) {
+    if (numDomains > 1) {
         ksDomainTime--;
         if (ksDomainTime == 0) {
             rescheduleRequired();
@@ -682,7 +683,7 @@ void awaken(void)
         assert(!isRoundRobin(awakened->tcbSchedContext));
         /* threads should wake up on the correct core */
         SMP_COND_STATEMENT(assert(awakened->tcbAffinity == getCurrentCPUIndex()));
-        /* threads HEAD refill should always be > MIN_BUDGET */
+        /* threads HEAD refill should always be >= MIN_BUDGET */
         assert(refill_sufficient(awakened->tcbSchedContext, 0));
         possibleSwitchTo(awakened);
         /* changed head of release queue -> need to reprogram */
