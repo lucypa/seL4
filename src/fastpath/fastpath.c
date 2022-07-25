@@ -100,30 +100,37 @@ void NORETURN fastpath_signal(word_t cptr, word_t msgInfo)
             }
 
             /*  Point of no return */
-
-            /* Equivalent to cancel_ipc */
-            endpoint_t *ep_ptr;
-            ep_ptr = EP_PTR(thread_state_get_blockingObject(dest->tcbState));
-            endpoint_ptr_set_epQueue_head_np(ep_ptr, TCB_REF(dest->tcbEPNext));
-            if (unlikely(dest->tcbEPNext)) {
-                dest->tcbEPNext->tcbEPPrev = NULL;
-            } else {
-                endpoint_ptr_mset_epQueue_tail_state(ep_ptr, 0, EPState_Idle);
-            }
-
-
 #ifdef CONFIG_BENCHMARK_TRACK_KERNEL_ENTRIES
             ksKernelEntry.is_fastpath = true;
 #endif
+
+            /* Equivalent to cancel_ipc */
+            endpoint_t *ep_ptr;
+            tcb_queue_t queue;
+            ep_ptr = EP_PTR(thread_state_get_blockingObject(dest->tcbState));
+
+            queue = ep_ptr_get_queue(ep_ptr);
+            queue = tcbEPDequeue(dest, queue);
+            ep_ptr_set_queue(ep_ptr, queue);
+
+            if (!queue.head) {
+                endpoint_ptr_set_state(ep_ptr, EPState_Idle);
+            }
+
+            reply_t *reply = REPLY_PTR(thread_state_get_replyObject(dest->tcbState));
+            if (reply != NULL) {
+                reply_unlink(reply, dest);
+            }
+
             /* Now we donate the SC. The checks required for this were
              * already done before the point of no return. */
+            setRegister(dest, badgeRegister, badge);
+            thread_state_ptr_set_tsType_np(&dest->tcbState, ThreadState_Running);
+
             if (!dest->tcbSchedContext) {
                 schedContext_donate(sc, dest);
             }
             assert(dest->tcbSchedContext);
-
-            setRegister(dest, badgeRegister, badge);
-            thread_state_ptr_set_tsType_np(&dest->tcbState, ThreadState_Running);
 
             /* If dest was already not schedulable prior to the budget check
              * the slowpath doesn't seem to do anything special besides just not
@@ -152,7 +159,7 @@ void NORETURN fastpath_signal(word_t cptr, word_t msgInfo)
         }
     }
     case NtfnState_Waiting: {
-        tcb_t * dest = TCB_PTR(notification_ptr_get_ntfnQueue_head(ntfnPtr));
+        tcb_t *dest = TCB_PTR(notification_ptr_get_ntfnQueue_head(ntfnPtr));
 
         /* Signal to higher prio thread is NOT fastpathed*/
         if (NODE_STATE(ksCurThread)->tcbPriority < dest->tcbPriority) {
@@ -189,6 +196,10 @@ void NORETURN fastpath_signal(word_t cptr, word_t msgInfo)
         }
 
         /*  Point of no return */
+#ifdef CONFIG_BENCHMARK_TRACK_KERNEL_ENTRIES
+        ksKernelEntry.is_fastpath = true;
+#endif
+
         tcb_queue_t ntfn_queue;
         ntfn_queue.head = (tcb_t *)notification_ptr_get_ntfnQueue_head(ntfnPtr);
         ntfn_queue.end = (tcb_t *)notification_ptr_get_ntfnQueue_tail(ntfnPtr);
@@ -202,20 +213,15 @@ void NORETURN fastpath_signal(word_t cptr, word_t msgInfo)
             notification_ptr_set_state(ntfnPtr, NtfnState_Idle);
         }
 
-#ifdef CONFIG_BENCHMARK_TRACK_KERNEL_ENTRIES
-        ksKernelEntry.is_fastpath = true;
-#endif
-
         /* Now we donate the SC. The checks required for this were
          * already done before the point of no return. */
+        setRegister(dest, badgeRegister, badge);
+        thread_state_ptr_set_tsType_np(&dest->tcbState, ThreadState_Running);
+
         if (!dest->tcbSchedContext) {
             schedContext_donate(sc, dest);
         }
         assert(dest->tcbSchedContext);
-
-
-        setRegister(dest, badgeRegister, badge);
-        thread_state_ptr_set_tsType_np(&dest->tcbState, ThreadState_Running);
 
         /* If dest was already not schedulable prior to the budget check
          * the slowpath doesn't seem to do anything special besides just not
