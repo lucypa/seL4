@@ -6,6 +6,11 @@
 
 #pragma once
 
+#ifdef CONFIG_KERNEL_MCS
+#include <object/reply.h>
+#include <object/notification.h>
+#endif
+
 /* Fastpath cap lookup.  Returns a null_cap on failure. */
 static inline cap_t FORCE_INLINE lookup_fp(cap_t cap, cptr_t cptr)
 {
