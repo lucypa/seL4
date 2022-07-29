@@ -2564,7 +2564,7 @@ exception_t benchmark_arch_map_logBuffer(word_t frame_cptr)
                              1,                         /* access flag */
                              SMP_TERNARY(SMP_SHARE, 0), /* Inner-shareable if SMP enabled, otherwise unshared */
                              0,                         /* VMKernelOnly */
-                             NORMAL_WT);
+                             NORMAL);
 
     cleanByVA_PoU((vptr_t)armKSGlobalLogPDE, addrFromKPPtr(armKSGlobalLogPDE));
     invalidateTranslationSingle(KS_LOG_PPTR);

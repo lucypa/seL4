@@ -81,6 +81,7 @@ exception_t handle_SysBenchmarkSetLogBuffer(void)
         return EXCEPTION_SYSCALL_ERROR;
     }
 
+    ksLogIndex = 0;
     setRegister(NODE_STATE(ksCurThread), capRegister, seL4_NoError);
     return EXCEPTION_NONE;
 }

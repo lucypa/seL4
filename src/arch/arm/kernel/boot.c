@@ -322,8 +322,8 @@ static BOOT_CODE bool_t try_init_kernel(
     paddr_t ui_p_reg_end,
     sword_t pv_offset,
     vptr_t  v_entry,
-    paddr_t dtb_addr_start,
-    paddr_t dtb_addr_end,
+    paddr_t dtb_phys_addr,
+    paddr_t dtb_size,
     paddr_t extra_device_addr_start,
     paddr_t extra_device_addr_end
 )
@@ -644,12 +644,12 @@ BOOT_CODE VISIBLE void init_kernel(
 )
 {
     bool_t result;
-    paddr_t dtb_end_p = 0;
+    //paddr_t dtb_end_p = 0;
     paddr_t extra_device_end_p = extra_device_size;
 
-    if (dtb_addr_p) {
-        dtb_end_p = dtb_addr_p + dtb_size;
-    }
+    //if (dtb_addr_p) {
+    //    dtb_end_p = dtb_addr_p + dtb_size;
+    //}
     if (extra_device_addr_p) {
         extra_device_end_p = extra_device_addr_p + extra_device_size;
     }
@@ -661,7 +661,7 @@ BOOT_CODE VISIBLE void init_kernel(
                                  ui_p_reg_end,
                                  pv_offset,
                                  v_entry,
-                                 dtb_addr_p, dtb_end_p,
+                                 dtb_addr_p, dtb_size,
                                  extra_device_addr_p, extra_device_end_p
                                  );
     } else {
@@ -673,7 +673,7 @@ BOOT_CODE VISIBLE void init_kernel(
                              ui_p_reg_end,
                              pv_offset,
                              v_entry,
-                             dtb_addr_p, dtb_end_p,
+                             dtb_addr_p, dtb_size,
                              extra_device_addr_p, extra_device_end_p
                              );
 

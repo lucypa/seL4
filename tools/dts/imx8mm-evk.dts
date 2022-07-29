@@ -531,6 +531,15 @@
 		};
 	};
 
+	gpt@302d0000 {
+		compatible = "fsl,imx8mm-gpt", "fsl,imx7d-gpt";
+		reg = <0x0 0x302d0000 0x0 0x10000>;
+		interrupts = < 0x0 0x37 0x4 >;
+		clocks = < 0x04 0xc5 0x04 0xc5 0x04 0xf9 >;
+		clock-names = "ipg", "per", "osc_per";
+		status = "okay";
+	};
+
 	pinctrl@30330000 {
 		compatible = "fsl,imx8mm-iomuxc";
 		reg = < 0x00 0x30330000 0x00 0x10000 >;
